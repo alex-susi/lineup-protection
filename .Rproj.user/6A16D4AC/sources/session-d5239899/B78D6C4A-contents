@@ -65,7 +65,7 @@ woba_summary_by_player_season <- function(data) {
 
 
 df_woba <- woba_summary_by_player_season(data_all) %>%
-  #filter(year >= 2021) %>%
+  filter(year >= 2016) %>%
   mutate(season_id = as.integer(factor(year, levels = sort(unique(year)))))
 
 
@@ -73,7 +73,6 @@ df_woba <- woba_summary_by_player_season(data_all) %>%
 
 
 ## Gets Primary position for each player in each season -----------------------------
-
 
 get_positions <- function(data_all = data_all,
                           df_woba = df_woba,
@@ -143,95 +142,14 @@ get_positions <- function(data_all = data_all,
 
 df_woba <- get_positions(data_all, df_woba)
 
-df_woba %>%
-  filter(batter_id == 443558) #%>%
-  #filter(primary_position == "DH", year != 2020) #%>%
-  #filter(is.na(primary_position))
-  #filter(batter_name == "Stanton, Giancarlo")
-  #filter(batter_name == "Judge, Aaron")
-  
-
-
-
-
-## Stan Model WITHOUT Age Curve and Positional Adjustments --------------------------
-
-# 1) Stan model
-stan_code_wOBA_2 <- "
-
-data {
-  int<lower=1> J;               // number of players
-  vector[J] y;                  // historical xwOBA
-  int<lower=0> N[J];            // historical plate appearances
-}
-
-
-parameters {
-  real<lower=0,upper=1> mu;     // true league mean
-  real<lower=0> tau;            // between-player sd
-  real<lower=0> sigma;          // measurement noise scale
-  vector[J] theta;              // true xwOBA for each player
-}
-
-
-model {
-  // Priors
-  mu    ~ normal(0.320, 0.05);  // league-average prior (0.320)
-  tau   ~ cauchy(0, 0.05);
-  sigma ~ cauchy(0, 0.05);
-  theta ~ normal(mu, tau);
-
-  // Likelihood: only for players with N[j] > 0
-  for (j in 1:J) {
-    if (N[j] > 0)
-      y[j] ~ normal(theta[j], sigma / sqrt(N[j]));
-  }
-}
-
-
-generated quantities {
-  vector[J] stabilized_xwoba;
-  for (j in 1:J)
-    stabilized_xwoba[j] = theta[j];
-}
-
-"
-
-# 2) Prepare data
-stan_data_woba <- list(J = nrow(df_woba),
-                       y = df_woba$hist_xwoba,
-                       N = df_woba$hist_PA)
-
-# 3) Fit
-fit_woba_2 <- stan(model_code = stan_code_wOBA_2,
-                   data = stan_data_woba,
-                   iter = 2000,
-                   warmup = 1000,
-                   chains = 4,
-                   seed = 123,
-                   control = list(adapt_delta = 0.95),
-                   cores = parallel::detectCores())
-
-# 4) Extract stabilized xwOBA (posterior means of theta)
-post <- extract(fit_woba_2, pars = "stabilized_xwoba")$stabilized_xwoba
-
-df_woba <- df_woba %>%
-  mutate(stabilized_xwoba = apply(post, 2, mean),
-         ci_lower_95 = apply(post, 2, quantile, probs = 0.025),
-         ci_upper_95 = apply(post, 2, quantile, probs = 0.975))
-
-# Now df_woba$stabilized_xwoba holds your shrinkage estimates!
-
-
-# 4) (Optional) Inspect a few rows
-head(df_woba[, c("batter_name","hist_PA","stab_xwoba","ci_lower_95","ci_upper_95")])
 
 
 
 
 
-## Stan Model with Age Curve and Positional Adjustments -----------------------------
+## Stabilized xwOBA with Age Curve and Positional Adjustments -----------------------
 
+# 1) Stan Model
 stan_code_wOBA <- "
 
 data {
@@ -284,29 +202,34 @@ model {
 generated quantities {
   vector[J] y_rep;
   
-  for (j in 1:J)
-    y_rep[j] = normal_rng(theta[j], sigma / sqrt(N[j]));
+for (j in 1:J) {
+    if (N[j] > 0) {
+      // realistic posterior‐predictive draw
+      y_rep[j] = normal_rng(theta[j], sigma / sqrt(N[j]));
+    } else {
+      // no plate appearances → just return the latent theta (or league mean)
+      y_rep[j] = theta[j];
+    }
+  }
 }
 
 "
 
 
-
-
-# 1) Build spline basis (4 basis functions, cubic) on age
+# 2) Build spline basis (4 basis functions, cubic) on age
 #    The `intercept=TRUE` means B_1...B_4 sum to 1 at each age.
 Bmat <- bs(df_woba$age, df = 4, degree = 3, intercept = TRUE)
 
 
-# 2) turn primary_position into an integer code 1..9
-#    Mapping: 1="DH", 2="C", 3="1B", 4="2B", 5="3B", 
-#             6="SS",7="LF", 8="CF", 9="RF"
+# 3) Turn primary_position into an integer code 1..9
+#    Mapping: 1 = "DH", 2 = "C", 3 = "1B", 4 = "2B", 5 = "3B", 
+#             6 = "SS", 7 = "LF", 8 = "CF",  9= "RF"
 pos_levels <- c("DH","C","1B","2B","3B","SS","LF","CF","RF")
 df_woba <- df_woba %>%
   mutate(pos_idx = match(primary_position, pos_levels))
 
 
-# 3) assemble the stan data list
+# 4) Prepare data
 stan_data_wOBA <- list(J       = nrow(df_woba),
                        y       = df_woba$hist_xwoba,
                        N       = df_woba$hist_PA,
@@ -317,22 +240,27 @@ stan_data_wOBA <- list(J       = nrow(df_woba),
 
 
 # 4) Fit the model
-fit <- stan(model_code = stan_code_wOBA,
-            data       = stan_data_wOBA,
-            iter       = 2000,
-            warmup     = 1000, 
-            chains     = 4,
-            seed       = 123,
-            control    = list(adapt_delta = 0.95),
-            cores      = parallel::detectCores())
+fit_wOBA <- stan(model_code = stan_code_wOBA,
+                 data       = stan_data_wOBA,
+                 iter       = 2000,
+                 warmup     = 1000, 
+                 chains     = 4,
+                 seed       = 123,
+                 control    = list(adapt_delta = 0.95),
+                 cores      = parallel::detectCores())
 
 
 # 5) Extract posterior means (and CIs if you like)
-post_samples <- extract(fit, pars = "stabilized_xwoba")$stabilized_xwoba
 df_woba <- df_woba %>%
-  mutate(stab_xwoba = apply(post_samples, 2, mean),
-         ci_low     = apply(post_samples, 2, quantile, probs = 0.025),
-         ci_high    = apply(post_samples, 2, quantile, probs = 0.975))
+  mutate(stabilized_xwoba = apply(rstan::extract(fit_wOBA, pars = "theta")$theta, 2, 
+                                  mean),
+         ci_low = apply(rstan::extract(fit_wOBA, pars = "theta")$theta, 2,
+                        quantile, 
+                        probs = 0.025),
+         ci_high = apply(rstan::extract(fit_wOBA, pars = "theta")$theta, 2,
+                         quantile,
+                         probs = 0.975),
+         resid = hist_xwoba - stabilized_xwoba)
 
 
 
@@ -340,7 +268,7 @@ df_woba <- df_woba %>%
 
 
 # pull out all gamma samples: an array [iterations × K_pos × K_basis]
-gamma_samps <- rstan::extract(fit, pars="gamma")$gamma
+gamma_samps <- rstan::extract(fit_wOBA, pars="gamma")$gamma
 
 # summarise each position k’s spline coefficients
 # e.g. posterior mean ± 95% CI
@@ -348,18 +276,19 @@ gamma_summary <- apply(gamma_samps, c(2,3), function(x)
   c(mean = mean(x),
     hdi_lower = quantile(x, .025),
     hdi_upper = quantile(x, .975)))
-dimnames(as.data.frame(gamma_summary)) <- list(
-  Position = pos_levels,     # c("P","C","1B",…)
-  Spline   = paste0("B",1:4),
-  Stat     = c("mean","hdi_lower","hdi_upper")
-)
+
 print(gamma_summary)
 
 
 
 
-ages <- seq(min(df_woba$age), max(df_woba$age), length=100)
-Bgrid <- bs(ages, df=4, degree=3, intercept=TRUE)
+ages <- seq(min(df_woba$age), 
+            max(df_woba$age), 
+            length = 100)
+Bgrid <- bs(ages, 
+            df = 4, 
+            degree = 3, 
+            intercept = TRUE)
 
 # for each draw t and position k, compute f_k(ages)
 # this gives an array [draws × positions × ages]
@@ -386,45 +315,39 @@ ggplot(plot_df, aes(age, mean, color = Position)) +
        y = "f_k(age)", x = "Age")
 
 
-posterior <- as.array(fit)
+posterior <- as.array(fit_wOBA)
 
 # 3a) R̂ and n_eff
-print(fit, pars = c("mu","tau","sigma"), probs = c(.025,.5,.975))
+print(fit_wOBA, pars = c("mu", "tau", "sigma"), probs = c(.025, .5, .975))
 
 # 3b) Traceplots for key parameters
-mcmc_trace(posterior, pars = c("mu","tau","sigma"))
+mcmc_trace(posterior, pars = c("mu", "tau", "sigma"))
 
 # 3c) Pair‐plots for potential correlations
-mcmc_pairs(posterior, pars = c("mu","tau","sigma"))
-
-# 3d) Launch ShinyStan if you like an interactive dashboard
-# library(shinystan); launch_shinystan(fit)
+mcmc_pairs(posterior, pars = c("mu", "tau", "sigma"))
 
 
-library(bayesplot)
 
 # extract observed y and replicated y
-y_obs <- stan_data$y
-y_rep <- rstan::extract(fit, "y_rep")$y_rep
-
 # 4a) Density overlay
-ppc_dens_overlay(y = y_obs,
-                 yrep = y_rep[1:200, ]) +
-  ggtitle("PPC: observed vs rep hist_xwOBA")
+ppc_dens_overlay(y = stan_data_wOBA$y,
+                 yrep = rstan::extract(fit_wOBA, "y_rep")$y_rep[1:1000, ]) +
+  ggtitle("PPC: Observed (y) vs rep hist_xwOBA") + 
+  scale_x_continuous("wOBA",
+                     limits = c(0, 0.5))
 
 # 4b) Scatter of mean & SD
-ppc_stat(y = y_obs,
-         yrep = y_rep[1:200, ],
+ppc_stat(y = stan_data_wOBA$y,
+         yrep = rstan::extract(fit_wOBA, "y_rep")$y_rep[1:200, ],
          stat = "mean")
-ppc_stat(y = y_obs,
-         yrep = y_rep[1:200, ],
+ppc_stat(y = stan_data_wOBA$y,
+         yrep = rstan::extract(fit_wOBA, "y_rep")$y_rep[1:200, ],
          stat = "sd")
 
 
-theta_hat <- apply(rstan::extract(fit, "stabilized_xwoba")$stabilized_xwoba, 2, mean)
-resid <- df_woba$hist_xwoba - theta_hat
-plot(df_woba$hist_PA, resid, xlab="PA", ylab="Residual", main="Residual vs PA")
-abline(h=0, lty=2)
+plot(df_woba$hist_PA, df_woba$resid, 
+     xlab = "PA", ylab = "Residual", main = "Residual vs Plate Appearances") + 
+  abline(h = 0, lty = 2)
 
 
 
@@ -438,15 +361,21 @@ abline(h=0, lty=2)
 
 
 woba_on_deck_lookup <- df_woba %>%
-  select(batter_id, year, posterior_theta) %>%
+  select(batter_id, year, stabilized_xwoba) %>%
   rename(on_deck_batter_id = batter_id,
-         stabilized_xwoba_on_deck = posterior_theta) %>%
-  mutate(lookup = paste0(on_deck_batter_id, "_", year + 1))
+         stabilized_xwoba_on_deck = stabilized_xwoba) %>%
+  mutate(lookup = paste0(on_deck_batter_id, "_", year))
 
 woba_lookup <- df_woba %>%
-  select(batter_id, year, posterior_theta) %>%
-  rename(stabilized_xwoba = posterior_theta) %>%
-  mutate(lookup = paste0(batter_id, "_", year + 1))
+  select(batter_id, year, stabilized_xwoba) %>%
+  rename(stabilized_xwoba = stabilized_xwoba) %>%
+  mutate(lookup = paste0(batter_id, "_", year))
+
+df_woba <- df_woba %>%
+  mutate(lookup = paste0(batter_id, "_", year),
+         stabilized_xwoba_on_deck = stabilized_xwoba)
+
+
 
 woba_lookup %>%
   filter(batter_id == 808982)

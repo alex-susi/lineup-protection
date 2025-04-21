@@ -2,7 +2,11 @@ library(dplyr)
 library(tidyr)
 
 
-on_deck <- function(df) {
+on_deck <- function(df, year_min) {
+  
+  
+  df <- df %>%
+    filter(year >= year_min)
   
   #
   # 1) One row per PA, assign an appearance_order within each game–team
@@ -22,6 +26,7 @@ on_deck <- function(df) {
     mutate(appearance_order = row_number()) %>%
     ungroup()
   
+  
   #
   # 2) Pull out each team’s original nine‐man lineup
   #
@@ -33,8 +38,9 @@ on_deck <- function(df) {
               lineup_names = list(batter_name),
               .groups      = "drop")
   
+  
   #
-  # 3) Simulate a rotating “batting‐order queue” for each team
+  # 3) Simulate a rotating batting‐order queue for each team
   #
   sim <- at_bats %>%
     left_join(lineup_lookup, by = c("game_id","batting_team")) %>%
@@ -118,8 +124,9 @@ on_deck <- function(df) {
     }) %>%
     ungroup()
   
+  
   #
-  # 4) Stitch everything back onto the original pitch‐level df
+  # 4) Join everything back onto the original pitch‐level data
   #
   df %>%
     left_join(at_bats %>%
@@ -145,32 +152,71 @@ on_deck <- function(df) {
                                            !is.na(override_on_deck_name),
                                          override_on_deck_name,
                                          natural_on_deck_name)) %>%
+    
+    # Looks up Stabilized xwOBA's of current batter and on-deck batter
     mutate(lookup = paste0(on_deck_batter_id, "_", year)) %>%
-    left_join(woba_on_deck_lookup %>%
+    left_join(df_woba %>%
                 select(lookup, stabilized_xwoba_on_deck),
               by = "lookup") %>%
     select(-lookup) %>%
     mutate(lookup = paste0(batter_id, "_", year)) %>%
-    left_join(woba_lookup %>%
+    left_join(df_woba %>%
                 select(lookup, stabilized_xwoba),
               by = "lookup") %>%
     select(-lookup) %>%
+    mutate(stabilized_xwoba = round(stabilized_xwoba, 3)) %>%
+    mutate(stabilized_xwoba_on_deck = round(stabilized_xwoba_on_deck, 3)) %>%
+    
+    # Binary Variable for In Strike Zone and Categorical Attack Zone
     mutate(in_strike_zone = ifelse(plate_x >= -(17/(12*2)) &
                                      plate_x <= (17/(12*2)) &
                                      plate_z >= strike_zone_bottom &
-                                     plate_z <= strike_zone_top, 1, 0)) %>%
+                                     plate_z <= strike_zone_top, 1, 0),
+           attack_zone = 'waste',
+           attack_zone = case_when(
+             plate_x >= -0.558 & 
+               plate_x <= 0.558 & 
+               plate_z >= 1.833 & 
+               plate_z <= 3.166 ~ 'heart',
+             plate_x >= -1.108 & 
+               plate_x <= 1.108 & 
+               plate_z >= 1.166 & 
+               plate_z <= 3.833 & 
+               attack_zone != 'heart' ~ 'shadow',
+             plate_x >= -1.666 & 
+               plate_x <= 1.666 & 
+               plate_z >= 0.5 & 
+               plate_z <= 4.5 & 
+               !attack_zone %in% c('heart', 'shadow') ~ 'chase',
+             TRUE ~ attack_zone)) %>%
     relocate(in_strike_zone, .after = plate_z) %>%
+    relocate(attack_zone, .after = in_strike_zone) %>%
+    relocate(on_deck_batter_id, .after = bat_side) %>%
+    relocate(on_deck_batter_name, .after = on_deck_batter_id) %>%
     relocate(stabilized_xwoba, .after = batter_name) %>%
     relocate(stabilized_xwoba_on_deck, .after = on_deck_batter_name) %>%
+    filter(!is.na(in_strike_zone),
+           !is.na(stabilized_xwoba_on_deck),
+           !is.na(stabilized_xwoba),
+           !is.na(delta_run_exp)) %>%
+    mutate(runners_on_base = rowSums(!is.na(across(c(pre_runner_1b_id, 
+                                                     pre_runner_2b_id, 
+                                                     pre_runner_3b_id))))) %>%
+    filter(balls < 4) %>%
+    filter(strikes < 3) %>%
     group_by(year) %>%
-    mutate(stabilized_xwoba_on_deck = ifelse(is.na(stabilized_xwoba_on_deck), 
-                                             mean(stabilized_xwoba_on_deck, 
-                                                  na.rm = TRUE), 
-                                             stabilized_xwoba_on_deck)) %>%
-    mutate(stabilized_xwoba = ifelse(is.na(stabilized_xwoba),
-                                     mean(stabilized_xwoba,
-                                          na.rm = TRUE),
-                                     stabilized_xwoba)) %>%
+    mutate(woba_mean = mean(stabilized_xwoba),
+           woba_on_deck_mean = mean(stabilized_xwoba_on_deck),
+      
+           # center around the overall average, then scale so +1 unit = +0.010 wOBA
+           woba_c = (stabilized_xwoba - woba_mean) * 100,
+           woba_on_deck_c = (stabilized_xwoba_on_deck - woba_on_deck_mean) * 100) %>%
+    relocate(woba_c, .after = stabilized_xwoba) %>%
+    relocate(woba_on_deck_c, .after = stabilized_xwoba_on_deck) %>%
+    select(-woba_mean, -woba_on_deck_mean, -appearance_order, -expected_id,
+           -expected_name, -natural_on_deck_id, -natural_on_deck_name, 
+           -is_last_ab, -replaced_starter_id, -replaced_starter_name, 
+           -true_lineup_spot, -override_on_deck_id, -override_on_deck_name,) %>%
     ungroup() %>%
     as.data.frame()
 }
@@ -182,8 +228,7 @@ on_deck <- function(df) {
 
 
 
-data_t <- data_all %>% on_deck()
-
+data_t <- data_all %>% on_deck(year_min = 2021)
 
     
 
@@ -192,4 +237,5 @@ data_t %>%
   #filter(on_deck_batter_name == "Iglesias, Jose") %>%
   tail() %>%
   as.data.frame()
+
 
